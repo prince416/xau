@@ -11,6 +11,7 @@
   const pct = (value, digits = 2) => `${value < 0 ? '-' : ''}${Math.abs(value || 0).toFixed(digits)}%`;
   const number = (value, digits = 2) => Number.isFinite(value) ? value.toLocaleString('en-US', { maximumFractionDigits: digits, minimumFractionDigits: digits }) : '—';
   const wait = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+  const withTimeout = (promise, ms, message) => Promise.race([promise, new Promise((_, reject) => setTimeout(() => reject(new Error(message)), ms))]);
   const timeframeMinutes = { M1: 1, M3: 3, M5: 5, M15: 15, M30: 30, H1: 60, H4: 240, D1: 1440 };
 
   const RUNNER_GUIDE = `# Helio Lab runner contract
@@ -265,12 +266,12 @@ Important: Helio executes code only on your computer at 127.0.0.1. Run files you
         const script = document.createElement('script');
         script.src = `${PYODIDE_INDEX}pyodide.js`;
         script.onload = resolve;
-        script.onerror = () => reject(new Error('Could not load the browser Python runtime. Check your internet connection and try again.'));
+        script.onerror = () => reject(new Error('Browser Python was blocked. In Brave, turn Shields off for this site and refresh; also disable any ad blocker for prince416.github.io.'));
         document.head.append(script);
       });
     }
-    pyodideInstance = await window.loadPyodide({ indexURL: PYODIDE_INDEX });
-    await pyodideInstance.loadPackage(['numpy', 'pandas']);
+    pyodideInstance = await withTimeout(window.loadPyodide({ indexURL: PYODIDE_INDEX }), 45000, 'Browser Python did not start. In Brave, turn Shields off for this site and refresh.');
+    await withTimeout(pyodideInstance.loadPackage(['numpy', 'pandas']), 90000, 'Python packages were blocked or took too long. Turn Brave Shields off for this site, refresh, and try once more.');
     return pyodideInstance;
   }
 
@@ -355,7 +356,7 @@ runpy.run_path('strategy.py', run_name='__main__')
     overlay.classList.add('show'); overlay.setAttribute('aria-hidden', 'false'); progress.style.width = '0';
     try {
       for (let index = 0; index < 2; index++) { title.textContent = phases[index][0]; detail.textContent = phases[index][1]; progress.style.width = `${(index + 1) * 25}%`; steps.forEach((step, stepIndex) => step.classList.toggle('active', stepIndex === index)); await wait(260); }
-      title.textContent = phases[2][0]; detail.textContent = 'Loading browser Python packages, then running the strategy in a sandbox.'; progress.style.width = '70%'; steps.forEach((step, index) => step.classList.toggle('active', index === 2));
+      title.textContent = phases[2][0]; detail.textContent = 'First run downloads the browser Python engine (usually 30–90 seconds). If it stalls, turn Brave Shields off for this site.'; progress.style.width = '70%'; steps.forEach((step, index) => step.classList.toggle('active', index === 2));
       const payload = await runInBrowser(dataset, state.strategy);
       title.textContent = phases[3][0]; detail.textContent = phases[3][1]; progress.style.width = '100%'; steps.forEach((step, index) => step.classList.toggle('active', index === 3)); await wait(350);
       renderReport(reportFromRunner(payload));
