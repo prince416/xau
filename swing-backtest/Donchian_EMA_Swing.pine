@@ -39,13 +39,13 @@ const string GROUP_WINDOW = "Backtest window"
 int startDate = input.time(timestamp("21 Sep 2021 00:00 +0000"), "Start date (inclusive)", group = GROUP_WINDOW)
 int endDate = input.time(timestamp("02 Sep 2026 00:00 +0000"), "End date (inclusive)", group = GROUP_WINDOW)
 
-const string GROUP_RISK = "Risk and stops"
+const string GROUP_RISK = "Risk, stops & compounding"
 int baseAtrLength = input.int(14, "ATR bars (4H base)", minval = 1, maxval = 5000, group = GROUP_RISK)
 float initialStopAtr = input.float(2.5, "Initial stop (ATR ×)", minval = 0.1, maxval = 20, step = 0.1, group = GROUP_RISK)
 bool useTrailingStop = input.bool(true, "Use ATR trailing stop", group = GROUP_RISK)
 float trailingStopAtr = input.float(3.0, "Trailing distance (ATR ×)", minval = 0.1, maxval = 20, step = 0.1, group = GROUP_RISK)
-float riskPercent = input.float(1.0, "Risk per trade (% current equity)", minval = 0.1, maxval = 5, step = 0.1, group = GROUP_RISK,
-     tooltip = "Position size = current Strategy Tester equity × risk % ÷ initial stop distance. After each closed trade, the next position uses the updated equity, so profits and losses compound.")
+float riskPercent = input.float(1.0, "Risk per trade (% balance)", minval = 0.1, maxval = 5, step = 0.1, group = GROUP_RISK,
+     tooltip = "Default is 1%. Position size uses current balance (initial capital + closed net profit after fees) × risk % ÷ initial stop distance. The next trade compounds from the updated balance.")
 
 const string GROUP_TARGET = "Optional take profit"
 bool useFixedTarget = input.bool(false, "Enable fixed R:R target", group = GROUP_TARGET,
@@ -96,12 +96,13 @@ bool trendShortOk = not useEmaFilter or close < trendEma
 bool buySignal = barstate.isconfirmed and isTimeBasedChart and inDateRange and not na(atr) and not na(entryUpper) and trendLongOk and close > entryUpper
 bool sellSignal = barstate.isconfirmed and isTimeBasedChart and inDateRange and not na(atr) and not na(entryLower) and trendShortOk and close < entryLower
 
-// Recalculate size from current Strategy Tester equity at every flat entry. The
-// signal candle's ATR is retained for the next-open entry, like the dashboard.
-// Closed P&L and fees change equity, so the next trade compounds from that balance.
+// Use realized balance at every flat entry: initial capital plus closed net P&L.
+// This excludes unrealized open-trade P&L; fees are included in strategy.netprofit.
+// The signal candle's ATR is retained for the next-open entry, like the dashboard.
 float pointValue = math.max(nz(syminfo.pointvalue, 1.0), 0.0000001)
 float signalStopDistance = math.max(atr * initialStopAtr, close * 0.0001)
-float riskCash = strategy.equity * riskPercent / 100.0
+float currentBalance = math.max(strategy.initial_capital + strategy.netprofit, 0.0)
+float riskCash = currentBalance * riskPercent / 100.0
 int stopTicks = int(math.max(1, math.round(signalStopDistance / syminfo.mintick)))
 float orderQuantity = riskCash / (signalStopDistance * pointValue)
 int targetTicks = int(math.max(1, math.round(stopTicks * targetRR)))
