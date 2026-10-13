@@ -1,0 +1,303 @@
+//@version=6
+// Northstar Donchian + EMA swing strategy
+// Long: confirmed close above the prior entry channel while above the EMA trend filter.
+// Short: confirmed close below the prior entry channel while below the EMA trend filter.
+// Entry fills next bar open. Initial ATR stop and optional trailing stop manage risk;
+// a close beyond the opposite exit channel closes the position.
+// Position size risks the selected percentage of current strategy equity, so it compounds.
+strategy(
+     "Northstar - Donchian + EMA Swing MTF",
+     shorttitle = "Northstar MTF",
+     overlay = true,
+     initial_capital = 10000,
+     default_qty_type = strategy.fixed,
+     default_qty_value = 1,
+     pyramiding = 0,
+     commission_type = strategy.commission.percent,
+     commission_value = 0.05,
+     slippage = 0,
+     margin_long = 50,
+     margin_short = 50,
+     process_orders_on_close = false,
+     use_bar_magnifier = true,
+     fill_orders_on_standard_ohlc = true,
+     max_labels_count = 300,
+     max_boxes_count = 500)
+
+// Uses the selected chart's native candles. Lower intraday charts automatically
+// scale the 4H lookbacks to keep approximately the same swing horizon.
+
+const string GROUP_SIGNAL = "Signal rules"
+bool autoScaleIntraday = input.bool(true, "Auto-scale below 4H", group = GROUP_SIGNAL,
+     tooltip = "Uses the 4H bar horizon on lower timeframes (for example, 1H uses 4× the periods). 4H and higher charts use their own bars.")
+int baseEntryLength = input.int(20, "Entry channel bars (4H base)", minval = 2, maxval = 5000, group = GROUP_SIGNAL)
+int baseExitLength = input.int(10, "Exit channel bars (4H base)", minval = 2, maxval = 5000, group = GROUP_SIGNAL)
+int baseEmaLength = input.int(200, "EMA trend bars (4H base)", minval = 2, maxval = 5000, group = GROUP_SIGNAL)
+bool useEmaFilter = input.bool(true, "Use EMA trend filter", group = GROUP_SIGNAL)
+
+const string GROUP_WINDOW = "Backtest window"
+int startDate = input.time(timestamp("21 Sep 2021 00:00 +0000"), "Start date (inclusive)", group = GROUP_WINDOW)
+int endDate = input.time(timestamp("02 Sep 2026 00:00 +0000"), "End date (inclusive)", group = GROUP_WINDOW)
+
+const string GROUP_RISK = "Risk and stops"
+int baseAtrLength = input.int(14, "ATR bars (4H base)", minval = 1, maxval = 5000, group = GROUP_RISK)
+float initialStopAtr = input.float(2.5, "Initial stop (ATR ×)", minval = 0.1, maxval = 20, step = 0.1, group = GROUP_RISK)
+bool useTrailingStop = input.bool(true, "Use ATR trailing stop", group = GROUP_RISK)
+float trailingStopAtr = input.float(3.0, "Trailing distance (ATR ×)", minval = 0.1, maxval = 20, step = 0.1, group = GROUP_RISK)
+float riskPercent = input.float(1.0, "Risk per trade (% current equity)", minval = 0.1, maxval = 5, step = 0.1, group = GROUP_RISK,
+     tooltip = "Position size = current Strategy Tester equity × risk % ÷ initial stop distance. After each closed trade, the next position uses the updated equity, so profits and losses compound.")
+
+const string GROUP_TARGET = "Optional take profit"
+bool useFixedTarget = input.bool(false, "Enable fixed R:R target", group = GROUP_TARGET,
+     tooltip = "Off matches the dashboard system. The chart still shows the R:R projection, but it is visual only and will not close the trade.")
+float targetRR = input.float(2.0, "Target R:R", minval = 0.25, maxval = 20, step = 0.25, group = GROUP_TARGET)
+
+const string GROUP_DISPLAY = "Chart drawings"
+bool showHoldDrawings = input.bool(true, "Show TradingView-style TP / SL projection", group = GROUP_DISPLAY)
+int projectionBars = input.int(12, "Projection width (bars)", minval = 1, maxval = 100, group = GROUP_DISPLAY)
+bool showTradeLevels = input.bool(true, "Show entry and stop levels", group = GROUP_DISPLAY)
+bool showTrendLine = input.bool(true, "Show EMA trend line", group = GROUP_DISPLAY)
+bool showSignals = input.bool(true, "Show BUY / SELL markers", group = GROUP_DISPLAY)
+
+int chartTfSeconds = timeframe.in_seconds()
+bool isTimeBasedChart = not na(chartTfSeconds) and chartTfSeconds > 0
+int profileScale = isTimeBasedChart ? int(math.max(1, math.min(240, math.round(14400.0 / chartTfSeconds)))) : 1
+bool shouldScaleIntraday = autoScaleIntraday and isTimeBasedChart and chartTfSeconds < 14400
+int entryLength = math.min(5000, baseEntryLength * (shouldScaleIntraday ? profileScale : 1))
+int exitLength = math.min(5000, baseExitLength * (shouldScaleIntraday ? profileScale : 1))
+// EMA is recursively calculated below, so it can retain the full scaled period
+// even when it is longer than the built-in channel lookback limit.
+int emaLength = baseEmaLength * (shouldScaleIntraday ? profileScale : 1)
+int atrLength = math.min(5000, baseAtrLength * (shouldScaleIntraday ? profileScale : 1))
+
+// Calculate indicators from the full downloaded history, then apply the selected
+// backtest dates only to trade eligibility, matching the dashboard replay.
+const int DATA_START = timestamp("21 Sep 2021 00:00 +0000")
+int endExclusive = endDate + 24 * 60 * 60 * 1000
+bool afterDataStart = time >= DATA_START
+bool inDateRange = time >= startDate and time < endExclusive
+float trueRange = not afterDataStart ? na : (na(time[1]) or time[1] < DATA_START ? high - low : math.max(high - low, math.max(math.abs(high - close[1]), math.abs(low - close[1]))))
+float atr = ta.sma(trueRange, atrLength)
+
+// Match the dashboard's recursively seeded EMA (first available close is the seed).
+var float trendEma = na
+trendEma := not afterDataStart ? na : na(trendEma[1]) ? close : trendEma[1] + (2.0 / (emaLength + 1.0)) * (close - trendEma[1])
+
+// Channel levels exclude the current candle, matching the dashboard backtest.
+float highSinceStart = afterDataStart ? high : na
+float lowSinceStart = afterDataStart ? low : na
+float entryUpper = ta.highest(highSinceStart[1], entryLength)
+float entryLower = ta.lowest(lowSinceStart[1], entryLength)
+float exitLower = ta.lowest(lowSinceStart[1], exitLength)
+float exitUpper = ta.highest(highSinceStart[1], exitLength)
+
+bool trendLongOk = not useEmaFilter or close > trendEma
+bool trendShortOk = not useEmaFilter or close < trendEma
+bool buySignal = barstate.isconfirmed and isTimeBasedChart and inDateRange and not na(atr) and not na(entryUpper) and trendLongOk and close > entryUpper
+bool sellSignal = barstate.isconfirmed and isTimeBasedChart and inDateRange and not na(atr) and not na(entryLower) and trendShortOk and close < entryLower
+
+// Recalculate size from current Strategy Tester equity at every flat entry. The
+// signal candle's ATR is retained for the next-open entry, like the dashboard.
+// Closed P&L and fees change equity, so the next trade compounds from that balance.
+float pointValue = math.max(nz(syminfo.pointvalue, 1.0), 0.0000001)
+float signalStopDistance = math.max(atr * initialStopAtr, close * 0.0001)
+float riskCash = strategy.equity * riskPercent / 100.0
+int stopTicks = int(math.max(1, math.round(signalStopDistance / syminfo.mintick)))
+float orderQuantity = riskCash / (signalStopDistance * pointValue)
+int targetTicks = int(math.max(1, math.round(stopTicks * targetRR)))
+var int pendingStopTicks = na
+
+var int liveEntryBar = na
+var float liveEntryPrice = na
+var int liveSide = 0
+var float liveStop = na
+var float liveTarget = na
+var float liveRiskDistance = na
+var float liveProjectionTarget = na
+var float bestPrice = na
+var box liveRewardBox = na
+var box liveRiskBox = na
+var int processedClosedTrades = 0
+
+// Finalize the position-style projection when a trade closes.
+if strategy.closedtrades > processedClosedTrades
+    int closedIndex = strategy.closedtrades - 1
+    int closedEntryBar = strategy.closedtrades.entry_bar_index(closedIndex)
+    int closedExitBar = strategy.closedtrades.exit_bar_index(closedIndex)
+    int closedRightBar = math.max(closedEntryBar + 1, closedExitBar)
+    float closedEntryPrice = strategy.closedtrades.entry_price(closedIndex)
+    float closedExitPrice = strategy.closedtrades.exit_price(closedIndex)
+    int closedSide = strategy.closedtrades.entry_id(closedIndex) == "Long" ? 1 : -1
+    int heldBars = math.max(1, closedExitBar - closedEntryBar + 1)
+    float heldHours = heldBars * nz(chartTfSeconds, 0) / 3600.0
+    string heldText = heldHours >= 24 ? str.tostring(heldHours / 24.0, "#.##") + "d" : str.tostring(heldHours, "#.#") + "h"
+    string durationText = str.tostring(heldBars) + (heldBars == 1 ? " bar · " : " bars · ") + heldText
+    float initialRiskDistance = nz(liveRiskDistance, nz(pendingStopTicks, stopTicks) * syminfo.mintick)
+    float initialStopPrice = closedEntryPrice - closedSide * initialRiskDistance
+    float closedProjectionTarget = closedEntryPrice + closedSide * initialRiskDistance * targetRR
+    float realizedR = initialRiskDistance > 0 ? (closedExitPrice - closedEntryPrice) * closedSide / initialRiskDistance : 0.0
+    color rewardColor = color.rgb(18, 139, 120)
+    color riskColor = color.rgb(199, 70, 93)
+
+    if showHoldDrawings
+        if na(liveRewardBox)
+            // Also handles trades that enter and exit within their first candle.
+            liveRewardBox := box.new(left = closedEntryBar, top = math.max(closedEntryPrice, closedProjectionTarget), right = closedRightBar, bottom = math.min(closedEntryPrice, closedProjectionTarget),
+                 xloc = xloc.bar_index, border_color = color.new(rewardColor, 20),
+                 bgcolor = color.new(rewardColor, 87), border_width = 1)
+        else
+            box.set_left(liveRewardBox, closedEntryBar)
+            box.set_right(liveRewardBox, closedRightBar)
+            box.set_top(liveRewardBox, math.max(closedEntryPrice, closedProjectionTarget))
+            box.set_bottom(liveRewardBox, math.min(closedEntryPrice, closedProjectionTarget))
+        box.set_text(liveRewardBox, str.tostring(targetRR, "#.##") + "R " + (useFixedTarget ? "TP" : "PROJ"))
+        box.set_text_color(liveRewardBox, color.rgb(13, 88, 76))
+        box.set_text_size(liveRewardBox, size.tiny)
+        box.set_text_halign(liveRewardBox, text.align_center)
+        box.set_text_valign(liveRewardBox, text.align_center)
+
+        if na(liveRiskBox)
+            liveRiskBox := box.new(left = closedEntryBar, top = math.max(closedEntryPrice, initialStopPrice), right = closedRightBar, bottom = math.min(closedEntryPrice, initialStopPrice),
+                 xloc = xloc.bar_index, border_color = color.new(riskColor, 20),
+                 bgcolor = color.new(riskColor, 88), border_width = 1)
+        else
+            box.set_left(liveRiskBox, closedEntryBar)
+            box.set_right(liveRiskBox, closedRightBar)
+            box.set_top(liveRiskBox, math.max(closedEntryPrice, initialStopPrice))
+            box.set_bottom(liveRiskBox, math.min(closedEntryPrice, initialStopPrice))
+        box.set_text(liveRiskBox, "INIT SL")
+        box.set_text_color(liveRiskBox, color.rgb(132, 38, 55))
+        box.set_text_size(liveRiskBox, size.tiny)
+        box.set_text_halign(liveRiskBox, text.align_center)
+        box.set_text_valign(liveRiskBox, text.align_center)
+
+        label.new(x = closedExitBar, y = closedExitPrice,
+             text = (closedSide == 1 ? "BUY" : "SELL") + "\n" + durationText + "\n" + (realizedR >= 0 ? "+" : "") + str.tostring(realizedR, "#.##") + "R",
+             xloc = xloc.bar_index, yloc = yloc.price,
+             style = closedSide == 1 ? label.style_label_down : label.style_label_up,
+             color = realizedR >= 0 ? rewardColor : riskColor, textcolor = color.white, size = size.small)
+
+    liveEntryBar := na
+    liveEntryPrice := na
+    liveSide := 0
+    liveStop := na
+    liveTarget := na
+    liveRiskDistance := na
+    liveProjectionTarget := na
+    bestPrice := na
+    liveRewardBox := na
+    liveRiskBox := na
+    pendingStopTicks := na
+    processedClosedTrades := strategy.closedtrades
+
+// Register an open position. The relative stop submitted with the entry already
+// protects the entry candle; this block switches to an absolute trailing stop.
+if strategy.position_size != 0 and na(liveEntryBar)
+    liveSide := strategy.position_size > 0 ? 1 : -1
+    liveEntryBar := strategy.opentrades.entry_bar_index(0)
+    liveEntryPrice := strategy.position_avg_price
+    float entryStopDistance = nz(pendingStopTicks, stopTicks) * syminfo.mintick
+    liveRiskDistance := entryStopDistance
+    liveStop := liveEntryPrice - liveSide * entryStopDistance
+    liveTarget := useFixedTarget ? liveEntryPrice + liveSide * entryStopDistance * targetRR : na
+    liveProjectionTarget := liveEntryPrice + liveSide * entryStopDistance * targetRR
+    bestPrice := liveEntryPrice
+    if showHoldDrawings
+        color rewardColor = color.rgb(18, 139, 120)
+        color riskColor = color.rgb(199, 70, 93)
+        int projectionRight = bar_index + projectionBars
+        float initialStopPrice = liveEntryPrice - liveSide * liveRiskDistance
+        liveRewardBox := box.new(left = liveEntryBar, top = math.max(liveEntryPrice, liveProjectionTarget), right = projectionRight, bottom = math.min(liveEntryPrice, liveProjectionTarget),
+             xloc = xloc.bar_index, border_color = color.new(rewardColor, 20),
+             bgcolor = color.new(rewardColor, 87), border_width = 1)
+        box.set_text(liveRewardBox, str.tostring(targetRR, "#.##") + "R " + (useFixedTarget ? "TP" : "PROJ"))
+        box.set_text_color(liveRewardBox, color.rgb(13, 88, 76))
+        box.set_text_size(liveRewardBox, size.tiny)
+        box.set_text_halign(liveRewardBox, text.align_center)
+        box.set_text_valign(liveRewardBox, text.align_center)
+        liveRiskBox := box.new(left = liveEntryBar, top = math.max(liveEntryPrice, initialStopPrice), right = projectionRight, bottom = math.min(liveEntryPrice, initialStopPrice),
+             xloc = xloc.bar_index, border_color = color.new(riskColor, 20),
+             bgcolor = color.new(riskColor, 88), border_width = 1)
+        box.set_text(liveRiskBox, "INIT SL")
+        box.set_text_color(liveRiskBox, color.rgb(132, 38, 55))
+        box.set_text_size(liveRiskBox, size.tiny)
+        box.set_text_halign(liveRiskBox, text.align_center)
+        box.set_text_valign(liveRiskBox, text.align_center)
+    pendingStopTicks := na
+
+// Update the range and trail only after each completed candle. The new stop applies
+// from the next candle, matching the dashboard's completed-bar trailing behavior.
+if strategy.position_size > 0 and not na(liveEntryBar)
+    bestPrice := math.max(nz(bestPrice, liveEntryPrice), high)
+    if useTrailingStop and not na(atr)
+        float nextTrail = bestPrice - trailingStopAtr * atr
+        liveStop := math.max(liveStop, nextTrail)
+    if not na(liveRewardBox)
+        box.set_right(liveRewardBox, bar_index + projectionBars)
+    if not na(liveRiskBox)
+        box.set_right(liveRiskBox, bar_index + projectionBars)
+    strategy.exit("Long Exit", from_entry = "Long", stop = liveStop, limit = liveTarget)
+    if not na(exitLower) and close < exitLower
+        strategy.close("Long", comment = "Donchian exit channel", immediately = true)
+
+if strategy.position_size < 0 and not na(liveEntryBar)
+    bestPrice := math.min(nz(bestPrice, liveEntryPrice), low)
+    if useTrailingStop and not na(atr)
+        float nextTrail = bestPrice + trailingStopAtr * atr
+        liveStop := math.min(liveStop, nextTrail)
+    if not na(liveRewardBox)
+        box.set_right(liveRewardBox, bar_index + projectionBars)
+    if not na(liveRiskBox)
+        box.set_right(liveRiskBox, bar_index + projectionBars)
+    strategy.exit("Short Exit", from_entry = "Short", stop = liveStop, limit = liveTarget)
+    if not na(exitUpper) and close > exitUpper
+        strategy.close("Short", comment = "Donchian exit channel", immediately = true)
+
+// Close any remaining trade at the selected end date, as the dashboard backtest does.
+bool endOfWindow = time < endExclusive and time_close >= endExclusive
+if endOfWindow and strategy.position_size > 0
+    strategy.close("Long", comment = "End of test window", immediately = true)
+if endOfWindow and strategy.position_size < 0
+    strategy.close("Short", comment = "End of test window", immediately = true)
+
+// Show and alert only on bars where a fresh order can actually be placed.
+// This prevents repeated BUY / SELL markers while a position is already open.
+bool buyEntrySignal = strategy.position_size == 0 and buySignal and orderQuantity > 0 and not endOfWindow
+bool sellEntrySignal = strategy.position_size == 0 and sellSignal and orderQuantity > 0 and not endOfWindow
+
+// Entries are close-confirmed market orders and fill at the following bar's open.
+if buyEntrySignal
+    pendingStopTicks := stopTicks
+    strategy.entry("Long", strategy.long, qty = orderQuantity, comment = "Donchian breakout")
+    strategy.exit("Long Exit", from_entry = "Long", loss = stopTicks, profit = useFixedTarget ? targetTicks : na)
+
+if sellEntrySignal
+    pendingStopTicks := stopTicks
+    strategy.entry("Short", strategy.short, qty = orderQuantity, comment = "Donchian breakdown")
+    strategy.exit("Short Exit", from_entry = "Short", loss = stopTicks, profit = useFixedTarget ? targetTicks : na)
+
+plot(showTrendLine ? trendEma : na, "EMA trend", color = color.new(color.gray, 15), linewidth = 2)
+plot(showTradeLevels and strategy.position_size != 0 ? strategy.position_avg_price : na,
+     "Entry price", color = color.new(color.blue, 0), linewidth = 1, style = plot.style_linebr)
+plot(showTradeLevels and strategy.position_size != 0 ? liveStop : na,
+     "ATR stop / trail", color = color.new(color.red, 0), linewidth = 2, style = plot.style_linebr)
+plot(showTradeLevels and strategy.position_size != 0 ? liveProjectionTarget : na,
+     "R:R target / projection", color = color.new(color.green, 0), linewidth = 1, style = plot.style_linebr)
+plotshape(showSignals and buyEntrySignal, title = "BUY breakout", text = "BUY", style = shape.labelup,
+     location = location.belowbar, color = color.rgb(18, 139, 120), textcolor = color.white, size = size.tiny)
+plotshape(showSignals and sellEntrySignal, title = "SELL breakdown", text = "SELL", style = shape.labeldown,
+     location = location.abovebar, color = color.rgb(199, 70, 93), textcolor = color.white, size = size.tiny)
+var table timeframeNotice = table.new(position.top_right, 1, 1)
+if barstate.islast
+    if not isTimeBasedChart
+        table.cell(timeframeNotice, 0, 0, "Use a time-based chart", text_color = color.white,
+             bgcolor = color.rgb(199, 70, 93), text_size = size.small)
+    else
+        bool preferredSwingTf = chartTfSeconds >= 7200 and chartTfSeconds <= 86400
+        string tfLabel = timeframe.isintraday ? (chartTfSeconds % 3600 == 0 ? str.tostring(int(chartTfSeconds / 3600)) + "H" : str.tostring(int(chartTfSeconds / 60)) + "m") : timeframe.period
+        string tfStatus = (preferredSwingTf ? "Swing " : "Chart ") + tfLabel + " · " + str.tostring(entryLength) + "/" + str.tostring(exitLength) + " · EMA " + str.tostring(emaLength) + " · ATR " + str.tostring(atrLength)
+        table.cell(timeframeNotice, 0, 0, tfStatus, text_color = color.white,
+             bgcolor = preferredSwingTf ? color.rgb(18, 139, 120) : color.rgb(83, 101, 119), text_size = size.small)
+
+alertcondition(buyEntrySignal, "Donchian BUY", "Chart-timeframe Donchian breakout above EMA trend filter")
+alertcondition(sellEntrySignal, "Donchian SELL", "Chart-timeframe Donchian breakdown below EMA trend filter")
